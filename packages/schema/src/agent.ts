@@ -24,6 +24,8 @@ export const Info = Schema.Struct({
   id: ID,
   name: Name,
   model: Model.Ref.pipe(optional),
+  /** Ordered fallback models for this agent, tried from first to last when a provider is unusable. */
+  fallback: Schema.Array(Model.Ref).pipe(optional),
   request: Provider.Request,
   system: Schema.String.pipe(optional),
   description: Schema.String.pipe(optional),

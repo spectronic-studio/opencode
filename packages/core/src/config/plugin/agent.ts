@@ -3,6 +3,7 @@ export * as ConfigAgentPlugin from "./agent.js"
 import { define } from "@opencode/plugin/effect/plugin"
 import { Document, Info, type Entry } from "@opencode/schema/config"
 import { ConfigAgent } from "@opencode/schema/config/agent"
+import { Model } from "@opencode/schema/model"
 import path from "path"
 import { Effect, Option, PubSub, Schema, Stream } from "effect"
 import { Agent } from "../../agent.js"
@@ -108,6 +109,14 @@ export const Plugin = define({
                 providerID: item.model.providerID,
                 ...(item.model.variant === undefined ? {} : { variant: item.model.variant }),
               }
+            if (item.fallback !== undefined)
+              agent.fallback = item.fallback.map((candidate) =>
+                Model.Ref.make({
+                  providerID: candidate.providerID,
+                  id: candidate.model,
+                  ...(candidate.variant === undefined ? {} : { variant: candidate.variant }),
+                }),
+              )
             if (item.request !== undefined) {
               Object.assign(agent.request.headers, item.request.headers ?? {})
               Object.assign(agent.request.body, item.request.body ?? {})

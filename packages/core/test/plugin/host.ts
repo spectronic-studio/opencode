@@ -486,6 +486,7 @@ function agentInfo(value: Agent.Info) {
   return {
     ...value,
     model: value.model && { ...value.model },
+    fallback: value.fallback?.map((ref) => ({ ...ref })),
     request: {
       settings: { ...value.request.settings },
       headers: { ...value.request.headers },

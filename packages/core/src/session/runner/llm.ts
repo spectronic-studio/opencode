@@ -1,10 +1,12 @@
 export * as SessionRunnerLLM from "./llm.js"
 
 import { Message } from "@opencode/ai"
+import { Model } from "@opencode/schema/model"
 import { and, desc, eq, inArray, sql } from "drizzle-orm"
-import { Cause, Effect, Exit, FiberMap, Layer } from "effect"
+import { Cause, Clock, Effect, Exit, FiberMap, Layer } from "effect"
 import { Database } from "../../database/database.js"
 import { Bus } from "../../bus.js"
+import { ModelFallback } from "../../model-fallback.js"
 import { LocationLifecycle } from "../../location-lifecycle.js"
 import { InstructionState } from "../instruction-state.js"
 import { SessionCompaction } from "../compaction.js"
@@ -26,6 +28,8 @@ import { makeLocationNode } from "@opencode/util/effect/app-node"
 import { llmClient } from "../../effect/app-node-platform.js"
 import { StepFailedError } from "../error.js"
 import { SessionRunnerRetry } from "./retry.js"
+import { SessionRunnerModel } from "./model.js"
+import type { PluginHooks } from "../../plugin/hooks.js"
 import { SessionStep } from "./step.js"
 import { ToolOutput } from "../../tool-output.js"
 import { Plugin } from "../../plugin.js"
@@ -204,32 +208,91 @@ const layer = Layer.effect(
       const sessionID = first.session.id
       let assistantMessageID = SessionMessage.ID.create()
       const retry = yield* SessionRunnerRetry.make(bus, sessionID)
+      // Ordered model candidates for this step's attempts when a provider is unusable. The
+      // cursor tracks candidates consumed by this step; provider cooldowns live in ModelFallback
+      // and survive across steps and sessions in this process.
+      const candidates = first.agent.info.fallback ?? []
+      let switchAttempt = 0
+      let override: SessionRunnerModel.Resolved | undefined
       let initial: SessionContext.Loaded | undefined = first
       let recoverOverflow = true
       let recoverContinuation = true
+
+      /** Resolves a configured fallback candidate through the same pipeline as the session's own model; smaller context windows and tool-incapable entries are skipped. */
+      const resolveCandidate = Effect.fn("SessionRunner.resolveCandidate")(function* (
+        ref: Model.Ref,
+        current: SessionRunnerModel.Resolved,
+      ) {
+        const resolved = yield* context
+          .resolveModel({ ...first.session, model: ref })
+          .pipe(Effect.orElseSucceed(() => undefined))
+        if (resolved === undefined) return undefined
+        if (resolved.capabilities.tools === false) return undefined
+        if (
+          resolved.limit.context !== undefined &&
+          current.limit.context !== undefined &&
+          resolved.limit.context < current.limit.context
+        )
+          return undefined
+        return resolved
+      })
+
+      /** Next unconsumed candidate for this step; undefined once every candidate is unusable. */
+      const nextCandidate = Effect.fn("SessionRunner.nextFallbackCandidate")(function* (
+        current: SessionRunnerModel.Resolved,
+      ) {
+        const now = yield* Clock.currentTimeMillis
+        while (switchAttempt < candidates.length) {
+          const candidate = candidates[switchAttempt]!
+          switchAttempt++
+          if (ModelFallback.isUnavailable(candidate.providerID, now)) continue
+          const resolved = yield* resolveCandidate(candidate, current)
+          if (resolved === undefined) continue
+          yield* Effect.sync(() => ModelFallback.markFailure(current.ref.providerID, now))
+          return resolved
+        }
+        return undefined
+      })
+
+      /** Model for an attempt: an override the previous attempt scheduled, or a healthy candidate when the selected provider is on cooldown. */
+      const pickModel = Effect.fn("SessionRunner.pickFallbackModel")(function* (
+        current: SessionRunnerModel.Resolved,
+      ) {
+        if (override !== undefined) {
+          const picked = override
+          override = undefined
+          return picked
+        }
+        const now = yield* Clock.currentTimeMillis
+        if (!ModelFallback.isUnavailable(current.ref.providerID, now)) return current
+        return (yield* nextCandidate(current)) ?? current
+      })
+
       while (true) {
         // Reuse boundary preparation once; retries refresh context without delivering more input.
         const loaded = initial ?? (yield* prepareContext(sessionID).pipe(Effect.flatMap(context.load)))
         initial = undefined
-        const compacted = yield* compaction.compact({ reason: "auto", context: loaded })
+        const model = yield* pickModel(loaded.model)
+        const active = model === loaded.model ? loaded : { ...loaded, model }
+        const compacted = yield* compaction.compact({ reason: "auto", context: active })
         if (compacted.status === "failed") return yield* new StepFailedError({ error: compacted.error })
         if (compacted.status === "completed") {
           assistantMessageID = SessionMessage.ID.create()
           continue
         }
-        const stepLimitReached = loaded.agent.info.steps !== undefined && step >= loaded.agent.info.steps
+        const stepLimitReached = active.agent.info.steps !== undefined && step >= active.agent.info.steps
         const transcript = SessionModelRequest.baseTranscript({
-          agent: loaded.agent.info,
-          model: loaded.model,
-          tools: loaded.tools,
-          initial: loaded.initial,
-          messages: loaded.messages,
+          agent: active.agent.info,
+          model: active.model,
+          tools: active.tools,
+          initial: active.initial,
+          messages: active.messages,
         })
         const prepared = yield* context.request.primary({
-          session: loaded.session,
-          agent: loaded.agent.id,
-          model: loaded.model,
-          tools: loaded.tools,
+          session: active.session,
+          agent: active.agent.id,
+          model: active.model,
+          tools: active.tools,
           system: transcript.system,
           messages: stepLimitReached
             ? [...transcript.messages, Message.assistant(MAX_STEPS_PROMPT)]
@@ -237,35 +300,61 @@ const layer = Layer.effect(
           // Keep tool definitions on the final Step to preserve the provider's cached prefix.
           toolChoice: stepLimitReached ? "none" : undefined,
           webSocket: "session",
-          inputTokens: SessionCompaction.estimatePrompt(loaded),
+          inputTokens: SessionCompaction.estimatePrompt(active),
         })
         const outcome = yield* steps.attempt({
           isLocationClosed: lifecycle.isClosed,
           sessionID,
           assistantMessageID,
-          agent: loaded.agent.id,
-          model: loaded.model,
+          agent: active.agent.id,
+          model: active.model,
           prepared,
           retry: (cause, error, proposed) =>
-            retry.decide({
-              cause,
-              error,
-              agent: loaded.agent.id,
-              model: loaded.model.ref,
-              hook: prepared.retry,
-              retry: proposed,
+            Effect.gen(function* () {
+              // A provider unusable for this request is best answered by a configured
+              // candidate rather than sleeping on it; everything else (timeouts, broken
+              // streams) stays governed by the retry policy.
+              if (ModelFallback.isSwitchable(cause)) {
+                const switched = yield* nextCandidate(active.model)
+                if (switched !== undefined) {
+                  const event: PluginHooks.Domains["session"]["retry"] = {
+                    sessionID,
+                    agent: active.agent.id,
+                    model: active.model.ref,
+                    error,
+                    attempt: switchAttempt,
+                    decision: { retry: true, delay: 0 },
+                  }
+                  yield* prepared.retry(event)
+                  if (event.decision.retry) {
+                    override = switched
+                    return { retry: true as const, attempt: switchAttempt, delay: 0 }
+                  }
+                }
+              }
+              return yield* retry.decide({
+                cause,
+                error,
+                agent: active.agent.id,
+                model: active.model.ref,
+                hook: prepared.retry,
+                retry: proposed,
+              })
             }),
           recoverContinuation,
           recoverOverflow: Effect.suspend(() =>
             recoverOverflow
               ? compaction
-                  .compact({ reason: "overflow", context: loaded })
+                  .compact({ reason: "overflow", context: active })
                   .pipe(Effect.map((result) => result.status === "completed"))
               : Effect.succeed(false),
           ),
         })
         const completed = yield* SessionStep.Outcome.$match(outcome, {
-          Completed: (outcome) => Effect.succeed(outcome.needsContinuation),
+          Completed: Effect.fnUntraced(function* (outcome) {
+            ModelFallback.markHealthy(active.model.ref.providerID)
+            return outcome.needsContinuation
+          }),
           Retry: (outcome) =>
             retry.wait({
               decision: outcome.decision,

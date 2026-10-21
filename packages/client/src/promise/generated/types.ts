@@ -300,6 +300,8 @@ export type WebSearchID = string
 
 export type WebSearchResult = { url: string; title?: string; content?: string; time: { published?: number } }
 
+export type ConfigAgentFallbackCandidates = Array<string | { providerID: string; model: string; variant?: string }>
+
 export type McpProtocol = "legacy" | "auto" | "2026-07-28"
 
 export type ConfigWorktree = { directory: string }
@@ -2098,6 +2100,7 @@ export type AgentInfo = {
   id: AgentID
   name: string
   model?: ModelRef
+  fallback?: Array<ModelRef>
   request: ProviderRequest
   system?: string
   description?: string
@@ -2182,6 +2185,7 @@ export type ConfigEntry =
         agents?: {
           [x: string]: {
             model?: string | { providerID: string; model: string; variant?: string }
+            fallback?: ConfigAgentFallbackCandidates
             request?: { headers?: { [x: string]: string }; body?: { [x: string]: JsonValue } }
             system?: string
             description?: string

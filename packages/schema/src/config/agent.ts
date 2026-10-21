@@ -8,8 +8,15 @@ import { ConfigProvider } from "./provider.js"
 
 export const Color = Schema.String.check(Schema.isPattern(/^#[0-9a-fA-F]{6}$/u))
 
+/** Ordered fallback models for an agent, tried from first to last. */
+export const Candidates = Schema.Array(ConfigModel.Selection).annotate({
+  identifier: "Config.Agent.FallbackCandidates",
+})
+export type Candidates = typeof Candidates.Type
+
 export class Info extends Schema.Class<Info>("Config.Agent")({
   model: ConfigModel.Selection.pipe(optional),
+  fallback: Candidates.pipe(optional),
   request: ConfigProvider.Request.pipe(optional),
   system: Schema.String.pipe(optional),
   description: Schema.String.pipe(optional),
